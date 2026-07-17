@@ -4,8 +4,31 @@ terraform {
       source  = "hashicorp/aws"
       version = "= 6.55.0"
     }
+    tls = {
+      source  = "hashicorp/tls"
+      version = ">= 4.0"
+    }
   }
   required_version = ">= 1.5.0"
+
+  # Configure after creating the S3 bucket and DynamoDB table:
+  # backend "s3" {
+  #   bucket         = "YOUR_TERRAFORM_STATE_BUCKET"
+  #   key            = "eks/terraform.tfstate"
+  #   region         = "YOUR_REGION"
+  #   dynamodb_table = "YOUR_TERRAFORM_LOCK_TABLE"
+  #   encrypt        = true
+  # }
+}
+
+provider "aws" {
+  default_tags {
+    tags = {
+      Project     = "hg-eks"
+      ManagedBy   = "terraform"
+      Environment = "production"
+    }
+  }
 }
 
 # Network Setup
@@ -28,6 +51,12 @@ data "aws_availability_zones" "available" {
 
 locals {
   azs = data.aws_availability_zones.available.names
+
+  common_tags = {
+    Project     = "hg-eks"
+    ManagedBy   = "terraform"
+    Environment = "production"
+  }
 }
 
 resource "aws_subnet" "public" {
@@ -124,23 +153,51 @@ resource "aws_route_table_association" "private" {
   route_table_id = aws_route_table.private.id
 }
 
+# KMS Encryption
+
+resource "aws_kms_key" "eks" {
+  description             = "EKS secrets encryption key"
+  deletion_window_in_days = 7
+  enable_key_rotation     = true
+
+  tags = local.common_tags
+}
+
+resource "aws_kms_alias" "eks" {
+  name          = "alias/eks-secrets"
+  target_key_id = aws_kms_key.eks.key_id
+}
+
 # Cluster Setup
 
 resource "aws_eks_cluster" "hg_eks_cluster" {
   name = "hg-eks-cluster"
 
   access_config {
-    authentication_mode = "API"
+    authentication_mode                         = "API"
+    bootstrap_cluster_creator_admin_permissions = true
   }
 
   role_arn = aws_iam_role.cluster.arn
   version  = "1.35"
+
+  enabled_cluster_log_types = ["api", "audit", "authenticator", "controllerManager", "scheduler"]
+
+  encryption_config {
+    provider {
+      key_arn = aws_kms_key.eks.arn
+    }
+    resources = ["secrets"]
+  }
 
   vpc_config {
     subnet_ids = concat(
       values(aws_subnet.public)[*].id,
       values(aws_subnet.private)[*].id
     )
+    endpoint_private_access = true
+    endpoint_public_access  = true
+    public_access_cidrs     = var.allowed_cidrs
   }
 
   # Ensure that IAM Role permissions are created before and deleted
@@ -149,6 +206,8 @@ resource "aws_eks_cluster" "hg_eks_cluster" {
   depends_on = [
     aws_iam_role_policy_attachment.cluster_AmazonEKSClusterPolicy,
   ]
+
+  tags = local.common_tags
 }
 
 resource "aws_iam_role" "cluster" {
@@ -175,18 +234,104 @@ resource "aws_iam_role_policy_attachment" "cluster_AmazonEKSClusterPolicy" {
   role       = aws_iam_role.cluster.name
 }
 
+# OIDC Provider
+
+data "tls_certificate" "eks" {
+  url = aws_eks_cluster.hg_eks_cluster.identity[0].oidc[0].issuer
+}
+
+resource "aws_iam_openid_connect_provider" "eks" {
+  client_id_list  = ["sts.amazonaws.com"]
+  thumbprint_list = [data.tls_certificate.eks.certificates[0].sha1_fingerprint]
+  url             = aws_eks_cluster.hg_eks_cluster.identity[0].oidc[0].issuer
+
+  tags = local.common_tags
+}
+
+# VPC CNI IRSA
+
+resource "aws_iam_role" "vpc_cni" {
+  name = "eks-vpc-cni-role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect = "Allow"
+      Principal = {
+        Federated = aws_iam_openid_connect_provider.eks.arn
+      }
+      Action = "sts:AssumeRoleWithWebIdentity"
+      Condition = {
+        StringEquals = {
+          "${replace(aws_iam_openid_connect_provider.eks.url, "https://", "")}:sub" = "system:serviceaccount:kube-system:aws-node"
+          "${replace(aws_iam_openid_connect_provider.eks.url, "https://", "")}:aud" = "sts.amazonaws.com"
+        }
+      }
+    }]
+  })
+
+  tags = local.common_tags
+}
+
+resource "aws_iam_role_policy_attachment" "vpc_cni" {
+  policy_arn = "arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy"
+  role       = aws_iam_role.vpc_cni.name
+}
+
+# EKS Addons
+
+resource "aws_eks_addon" "vpc_cni" {
+  cluster_name             = aws_eks_cluster.hg_eks_cluster.name
+  addon_name               = "vpc-cni"
+  service_account_role_arn = aws_iam_role.vpc_cni.arn
+
+  resolve_conflicts_on_create = "OVERWRITE"
+  resolve_conflicts_on_update = "OVERWRITE"
+
+  depends_on = [aws_eks_node_group.eks_node_group]
+
+  tags = local.common_tags
+}
+
+resource "aws_eks_addon" "coredns" {
+  cluster_name = aws_eks_cluster.hg_eks_cluster.name
+  addon_name   = "coredns"
+
+  resolve_conflicts_on_create = "OVERWRITE"
+  resolve_conflicts_on_update = "OVERWRITE"
+
+  depends_on = [aws_eks_node_group.eks_node_group]
+
+  tags = local.common_tags
+}
+
+resource "aws_eks_addon" "kube_proxy" {
+  cluster_name = aws_eks_cluster.hg_eks_cluster.name
+  addon_name   = "kube-proxy"
+
+  resolve_conflicts_on_create = "OVERWRITE"
+  resolve_conflicts_on_update = "OVERWRITE"
+
+  depends_on = [aws_eks_node_group.eks_node_group]
+
+  tags = local.common_tags
+}
+
+# Node Group Setup
+
 resource "aws_eks_node_group" "eks_node_group" {
   cluster_name    = aws_eks_cluster.hg_eks_cluster.name
   node_group_name = "hg-eks-node-group"
   node_role_arn   = aws_iam_role.node_group.arn
-  subnet_ids      = values(aws_subnet.private)[*].id
-  instance_types = ["t3.small"]
+  subnet_ids     = values(aws_subnet.private)[*].id
+  instance_types = ["t3.medium"]
+  ami_type       = "AL2023_x86_64_STANDARD"
 
   disk_size = 20
 
   scaling_config {
-    desired_size = 1
-    max_size     = 2
+    desired_size = 2
+    max_size     = 4
     min_size     = 1
   }
 
@@ -198,7 +343,6 @@ resource "aws_eks_node_group" "eks_node_group" {
   # Otherwise, EKS will not be able to properly delete EC2 Instances and Elastic Network Interfaces.
   depends_on = [
     aws_iam_role_policy_attachment.node_group_AmazonEKSWorkerNodePolicy,
-    aws_iam_role_policy_attachment.node_group_AmazonEKS_CNI_Policy,
     aws_iam_role_policy_attachment.node_group_AmazonEC2ContainerRegistryReadOnly,
   ]
 }
@@ -220,11 +364,6 @@ resource "aws_iam_role" "node_group" {
 
 resource "aws_iam_role_policy_attachment" "node_group_AmazonEKSWorkerNodePolicy" {
   policy_arn = "arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy"
-  role       = aws_iam_role.node_group.name
-}
-
-resource "aws_iam_role_policy_attachment" "node_group_AmazonEKS_CNI_Policy" {
-  policy_arn = "arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy"
   role       = aws_iam_role.node_group.name
 }
 

@@ -3,3 +3,9 @@ variable "region" {
   description = "The AWS region to deploy resources in."
   default     = "eu-north-1"
 }
+
+variable "allowed_cidrs" {
+  type        = list(string)
+  description = "CIDRs allowed to access the EKS API endpoint. Restrict to your IP(s) in production."
+  default     = ["0.0.0.0/0"]
+}
