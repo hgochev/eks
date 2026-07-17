@@ -24,7 +24,7 @@ override.tf.json
 terraform.rc
 
 # Ignore lock files (optional, some teams commit this)
-# .terraform.lock.hcl
+.terraform.lock.hcl
 
 # Ignore plan output files
 *.tfplan
