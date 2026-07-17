@@ -6,6 +6,5 @@ variable "region" {
 
 variable "allowed_cidrs" {
   type        = list(string)
-  description = "CIDRs allowed to access the EKS API endpoint. Restrict to your IP(s) in production."
-  default     = ["0.0.0.0/0"]
+  description = "CIDRs allowed to access the EKS API endpoint"
 }
