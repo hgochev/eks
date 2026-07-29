@@ -22,6 +22,8 @@ terraform {
 }
 
 provider "aws" {
+  region = var.region
+
   default_tags {
     tags = {
       Project     = "hg-eks"
@@ -234,56 +236,14 @@ resource "aws_iam_role_policy_attachment" "cluster_AmazonEKSClusterPolicy" {
   role       = aws_iam_role.cluster.name
 }
 
-# OIDC Provider
-
-data "tls_certificate" "eks" {
-  url = aws_eks_cluster.hg_eks_cluster.identity[0].oidc[0].issuer
-}
-
-resource "aws_iam_openid_connect_provider" "eks" {
-  client_id_list  = ["sts.amazonaws.com"]
-  thumbprint_list = [data.tls_certificate.eks.certificates[0].sha1_fingerprint]
-  url             = aws_eks_cluster.hg_eks_cluster.identity[0].oidc[0].issuer
-
-  tags = local.common_tags
-}
-
-# VPC CNI IRSA
-
-resource "aws_iam_role" "vpc_cni" {
-  name = "eks-vpc-cni-role"
-
-  assume_role_policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [{
-      Effect = "Allow"
-      Principal = {
-        Federated = aws_iam_openid_connect_provider.eks.arn
-      }
-      Action = "sts:AssumeRoleWithWebIdentity"
-      Condition = {
-        StringEquals = {
-          "${replace(aws_iam_openid_connect_provider.eks.url, "https://", "")}:sub" = "system:serviceaccount:kube-system:aws-node"
-          "${replace(aws_iam_openid_connect_provider.eks.url, "https://", "")}:aud" = "sts.amazonaws.com"
-        }
-      }
-    }]
-  })
-
-  tags = local.common_tags
-}
-
-resource "aws_iam_role_policy_attachment" "vpc_cni" {
-  policy_arn = "arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy"
-  role       = aws_iam_role.vpc_cni.name
-}
+# OIDC Provider + VPC CNI IRSA omitted: requires iam:CreateOpenIDConnectProvider permission.
+# VPC CNI uses AmazonEKS_CNI_Policy attached directly to the node group role instead.
 
 # EKS Addons
 
 resource "aws_eks_addon" "vpc_cni" {
-  cluster_name             = aws_eks_cluster.hg_eks_cluster.name
-  addon_name               = "vpc-cni"
-  service_account_role_arn = aws_iam_role.vpc_cni.arn
+  cluster_name = aws_eks_cluster.hg_eks_cluster.name
+  addon_name   = "vpc-cni"
 
   resolve_conflicts_on_create = "OVERWRITE"
   resolve_conflicts_on_update = "OVERWRITE"
@@ -369,5 +329,10 @@ resource "aws_iam_role_policy_attachment" "node_group_AmazonEKSWorkerNodePolicy"
 
 resource "aws_iam_role_policy_attachment" "node_group_AmazonEC2ContainerRegistryReadOnly" {
   policy_arn = "arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly"
+  role       = aws_iam_role.node_group.name
+}
+
+resource "aws_iam_role_policy_attachment" "node_group_AmazonEKS_CNI_Policy" {
+  policy_arn = "arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy"
   role       = aws_iam_role.node_group.name
 }
