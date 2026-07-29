@@ -22,15 +22,14 @@ VPC (10.0.0.0/16)
 | NAT Gateway | Single NAT GW (in first AZ) for outbound node/pod traffic |
 | EKS Cluster | Managed control plane, Kubernetes 1.35, API-only auth mode |
 | KMS Key | Encrypts Kubernetes secrets at rest |
-| OIDC Provider | Enables IRSA (pod-level IAM roles) |
 | Node Group | Managed node group in private subnets, `t3.medium`, AL2023 |
-| EKS Addons | `vpc-cni` (with IRSA), `coredns`, `kube-proxy` |
+| EKS Addons | `vpc-cni`, `coredns`, `kube-proxy` |
 
 ## Prerequisites
 
 - [Terraform](https://developer.hashicorp.com/terraform/install) >= 1.5.0
 - [AWS CLI](https://docs.aws.amazon.com/cli/latest/userguide/install-cliv2.html) configured with appropriate permissions
-- IAM permissions to create VPC, EKS, IAM, and KMS resources
+- IAM permissions to create VPC, EKS, IAM, and KMS resources (`iam:CreateOpenIDConnectProvider` is **not** required)
 
 ## Usage
 
@@ -77,7 +76,7 @@ kubectl get nodes
 - API endpoint restricted to `allowed_cidrs` — set to your IP, not `0.0.0.0/0`
 - Nodes run in **private subnets** — not directly reachable from internet
 - Kubernetes secrets encrypted at rest with a dedicated KMS key (automatic rotation enabled)
-- VPC CNI uses **IRSA** — pod-level IAM, not node-level
+- VPC CNI uses node-level IAM (`AmazonEKS_CNI_Policy` attached to the node group role) — OIDC/IRSA omitted as it requires `iam:CreateOpenIDConnectProvider`
 - All CloudWatch log types enabled: `api`, `audit`, `authenticator`, `controllerManager`, `scheduler`
 
 ## CI/CD
